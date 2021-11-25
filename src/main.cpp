@@ -1,5 +1,6 @@
 #include <getopt.h>
 #include <iostream>
+#include <queue>
 #include "gdal_priv.h"
 #include "cpl_conv.h"
 
@@ -16,6 +17,32 @@ static void usage(const char* name)
             "\t-h, --help          display this message and exit\n",
             name, SpillDEM_VERSION_MAJOR, SpillDEM_VERSION_MINOR, name);
 }
+
+struct node
+{
+    float spill;
+    int x;
+    int y;
+
+    node(float spill, int x, int y) 
+        : spill(spill), x(x), y(y)
+    {}
+
+    bool operator<(const node& rhs) const
+    {
+        return spill > rhs.spill;
+    }
+};
+
+struct dir
+{
+    int dx;
+    int dy;
+
+    dir(int dx, int dy)
+        : dx(dx), dy(dy)
+    {}
+};
 
 int main(int argc, char* argv[])
 {
@@ -67,30 +94,121 @@ int main(int argc, char* argv[])
     in_file = argv[optind];
 
     GDALAllRegister();
-    const char *pszFormat = "GTiff";
-    GDALDriver *poDriver;
-    poDriver = GetGDALDriverManager()->GetDriverByName(pszFormat);
-    if( poDriver == nullptr )
+    const char *format = "GTiff";
+    GDALDriver *driver;
+    driver = GetGDALDriverManager()->GetDriverByName(format);
+    if( driver == nullptr )
     {
         exit(EXIT_FAILURE);
     }
 
-    GDALDataset *dem;
-    dem = (GDALDataset *)GDALOpen(in_file.c_str(), GA_ReadOnly);
-    if ( dem == nullptr)
+    GDALDataset *srcDataset;
+    srcDataset = (GDALDataset *)GDALOpen(in_file.c_str(), GA_ReadOnly);
+    if ( srcDataset == nullptr)
     {
         exit(EXIT_FAILURE);
     }
-    GDALDataset *filled_dem;
-    filled_dem = poDriver->CreateCopy(out_file.c_str(), dem, FALSE,
+
+    GDALDataset *dstDataset;
+    dstDataset = driver->CreateCopy(out_file.c_str(), srcDataset, FALSE,
                                       NULL, NULL, NULL );
-    if ( filled_dem == nullptr)
+    if ( dstDataset == nullptr )
     {
-        GDALClose(dem);
+        GDALClose(srcDataset);
         exit(EXIT_FAILURE);
     }
 
-    GDALClose(filled_dem);
-    GDALClose(dem);
+    GDALRasterBand *srcBand, *dstBand;
+    srcBand = srcDataset->GetRasterBand(1);
+    dstBand = dstDataset->GetRasterBand(1);
+    const int nx = srcBand->GetXSize(), ny = srcBand->GetYSize();
+    double nodata = srcBand->GetNoDataValue();
+
+    float *dem, *filleddem;
+    dem = (float *) CPLMalloc(sizeof(float)*nx*ny);
+    srcBand->RasterIO(GF_Read, 0, 0, nx, ny, dem, nx, ny, GDT_Float32, 0, 0);
+    dstBand->Fill(nodata);
+
+    filleddem = (float *) CPLMalloc(sizeof(float)*nx*ny);
+    std::array<dir, 8> ngh = {
+        dir(1, 0),
+        dir(1, -1),
+        dir(0, -1),
+        dir(-1, -1),
+        dir(-1, 0),
+        dir(-1, 1),
+        dir(0, 1),
+        dir(1, 1)
+    };
+
+    std::array<unsigned char, 8> d8 = {1, 2, 4, 8, 16, 32, 64, 128};
+    std::priority_queue<node> queue;
+    std::vector<bool> queued(nx*ny, false);
+    std::vector<bool> processed(nx*ny, false);
+    for (int x = 0; x < nx; x++) // fill edge cell with the elevation value
+    {
+        for (int y = 0; y < ny; y++)
+        {
+            bool edge;
+            if (dem[y * nx + x] == nodata)
+            {
+                edge = false;
+                processed[y * nx + x] = true;
+            }
+            else if (x == 0 || x == nx-1 || y == 0 || y == ny-1)
+            {
+                edge = true;
+            }
+            else
+            {
+                edge = false;
+                for (int d = 0; d < 8; d++)
+                {
+                    if (dem[(y + ngh[d].dy) * nx + (x + ngh[d].dx)] == nodata)
+                    {
+                        edge = true;
+                        break;
+                    }
+                }
+            }
+            filleddem[y * nx + x] = edge ? dem[y * nx + x] : nodata;
+            if (edge)
+            {
+                queue.push(node(filleddem[y * nx + x], x, y));
+                queued[y * nx + x] = true;
+            }
+        }
+    }
+
+    while (!queue.empty())
+    {
+        node c(queue.top());
+        queue.pop();
+        int cid = c.y*nx + c.x;
+        processed[cid] = true;
+        queued[cid] = false;
+        for (int d = 0; d < 8; d++)
+        {
+            int nghy = c.y+ngh[d].dy, nghx = c.x+ngh[d].dx; 
+            int nid = nghy * nx + nghx;
+            if (nghy < 0 || nghy >= ny || nghx < 0 || nghx >= nx || queued[nid] || processed[nid])
+            {
+                continue;
+            }
+            else
+            {
+                filleddem[nid] = std::max(dem[nid], filleddem[cid]);
+                queue.push(node(filleddem[nid], nghx, nghy));
+                queued[nid] = true;
+            }
+        }
+    }
+
+    dstBand->RasterIO(GF_Write, 0, 0, nx, ny, filleddem, nx, ny, dstBand->GetRasterDataType(), 0, 0);
+
+    CPLFree(dem);
+    CPLFree(filleddem);
+    GDALClose(dstDataset);
+    GDALClose(srcDataset);
     exit(EXIT_SUCCESS);
 }

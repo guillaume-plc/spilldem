@@ -36,3 +36,6 @@
 
 # Builds
 build/
+
+# raster files
+*.tif
